@@ -140,7 +140,8 @@ function latestReply(thread) {
 }
 function printStatus(thread) {
   const lt = thread.latestTurn;
-  console.log(`thread ${thread.id} "${thread.title}" turn=${lt ? lt.state : "none"}`);
+  const settled = thread.settledOverride === "settled" || (thread.settledAt != null && thread.settledOverride !== "active");
+  console.log(`thread ${thread.id} "${thread.title}" turn=${lt ? lt.state : "none"} settled=${settled ? `yes (${thread.settledAt ?? "override"})` : "no"}`);
   const reply = latestReply(thread);
   console.log(reply ? `reply:\n${reply}` : "reply: (none yet)");
 }
@@ -190,6 +191,7 @@ const USAGE = `t3-alpha <command> [options]
   create --project <id> --title <t> --prompt <p> [--timeout <sec>=900] [--no-wait]
   send   --thread <id> --prompt <p> [--timeout <sec>=900] [--no-wait]
   status --thread <id>        (alias: read)
+  settle --thread <id>
   batch  --file <path>        JSONL: {"cmd":"create","project":"...","title":"...","prompt":"..."}
 Config: ${CONFIG_PATH} (env T3_ALPHA_URL / T3_ALPHA_TOKEN override)`;
 
@@ -244,6 +246,12 @@ async function run(args, cfg, ctx) {
       const { thread } = await threadSnapshot(c, threadId);
       await sendPrompt(c, threadId, need("prompt"),
         { runtimeMode: thread.runtimeMode, interactionMode: thread.interactionMode }, thread.latestTurn?.turnId ?? null);
+      return;
+    }
+    case "settle": {
+      const threadId = need("thread");
+      const r = await (await rpc()).request("orchestration.dispatchCommand", { type: "thread.settle", commandId: randomUUID(), threadId });
+      console.log(`ok: settled thread ${threadId} (sequence ${r?.sequence})`);
       return;
     }
     case "status": case "read": {
