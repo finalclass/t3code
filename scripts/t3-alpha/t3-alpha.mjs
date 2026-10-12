@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-// t3-alpha: minimal console client for a T3 Code server (tested against wire format of v0.0.45).
+// t3-alpha: minimal console client for a T3 Code server (wire format of v0.0.45).
 // No dependencies; needs Node >= 22 (global fetch + WebSocket).
 // Wire: Effect RPC over WebSocket, JSON serialization (apps/server/src/ws.ts RpcSerialization.layerJson).
 import { readFileSync, writeFileSync, mkdirSync, existsSync } from "node:fs";
@@ -9,14 +9,11 @@ import { randomUUID } from "node:crypto";
 
 const CONFIG_PATH = process.env.T3_ALPHA_CONFIG || join(homedir(), ".config", "t3-alpha.json");
 
-export function loadConfig() {
+function loadConfig() {
   const c = existsSync(CONFIG_PATH) ? JSON.parse(readFileSync(CONFIG_PATH, "utf8")) : {};
   if (process.env.T3_ALPHA_URL) c.baseUrl = process.env.T3_ALPHA_URL;
   if (process.env.T3_ALPHA_TOKEN) c.token = process.env.T3_ALPHA_TOKEN;
-  c.baseUrl ||= "http://127.0.0.1:5773";
-  c.model ||= { instanceId: "codex", model: "gpt-5-codex", options: [] };
-  c.runtimeMode ||= "full-access";
-  c.interactionMode ||= "default";
+  c.baseUrl ||= c.url || "http://127.0.0.1:5773";
   return c;
 }
 function saveConfig(c) {
@@ -26,7 +23,6 @@ function saveConfig(c) {
 
 // ---- HTTP auth ----
 async function exchangePairingCode(baseUrl, code) {
-  // POST /oauth/token (packages/contracts/src/environmentHttp.ts, auth.ts AuthTokenExchangeRequest)
   const body = new URLSearchParams({
     grant_type: "urn:ietf:params:oauth:grant-type:token-exchange",
     subject_token: code,
@@ -36,39 +32,37 @@ async function exchangePairingCode(baseUrl, code) {
     client_device_type: "desktop",
   });
   const r = await fetch(new URL("/oauth/token", baseUrl), {
-    method: "POST",
-    headers: { "content-type": "application/x-www-form-urlencoded" },
-    body,
+    method: "POST", headers: { "content-type": "application/x-www-form-urlencoded" }, body,
   });
   const t = await r.text();
   if (!r.ok) throw new Error(`token exchange HTTP ${r.status}: ${t}`);
   return JSON.parse(t);
 }
 async function wsTicket(cfg) {
+  if (!cfg.token) throw new Error(`no token in ${CONFIG_PATH}; run login first`);
   const r = await fetch(new URL("/api/auth/websocket-ticket", cfg.baseUrl), {
-    method: "POST",
-    headers: { authorization: `Bearer ${cfg.token}` },
+    method: "POST", headers: { authorization: `Bearer ${cfg.token}` },
   });
-  const t = await r.text();
-  if (!r.ok) throw new Error(`websocket-ticket HTTP ${r.status}: ${t}`);
-  return JSON.parse(t).ticket;
+  if (!r.ok) throw new Error(`websocket-ticket HTTP ${r.status}`);
+  return (await r.json()).ticket;
 }
 
-// ---- Effect RPC client (JSON) ----
-export class RpcClient {
+// ---- Effect RPC client (JSON frames) ----
+class RpcClient {
   constructor(ws) {
-    this.ws = ws; this.next = 0; this.pending = new Map();
+    this.ws = ws; this.next = 0; this.pending = new Map(); this.closing = false;
     ws.addEventListener("message", (ev) => this.onMessage(String(ev.data)));
     ws.addEventListener("close", () => {
-      for (const p of this.pending.values()) p.reject(new Error("socket closed"));
+      const err = new Error("socket closed by server");
+      for (const p of this.pending.values()) this.closing ? p.resolve(undefined) : p.reject(err);
       this.pending.clear();
     });
+    this.ping = setInterval(() => ws.readyState === 1 && this.send({ _tag: "Ping" }), 10000);
   }
   static async connect(cfg) {
-    const ticket = await wsTicket(cfg);
     const u = new URL("/ws", cfg.baseUrl);
     u.protocol = u.protocol === "https:" ? "wss:" : "ws:";
-    u.searchParams.set("wsTicket", ticket);
+    u.searchParams.set("wsTicket", await wsTicket(cfg));
     u.searchParams.set("clientSurface", "web");
     u.searchParams.set("clientDeviceType", "desktop");
     u.searchParams.set("orchestrationProtocol", "1");
@@ -77,21 +71,25 @@ export class RpcClient {
       ws.addEventListener("open", res, { once: true });
       ws.addEventListener("error", () => rej(new Error("WebSocket connect failed")), { once: true });
     });
-    const c = new RpcClient(ws);
-    c.ping = setInterval(() => ws.readyState === 1 && ws.send(JSON.stringify({ _tag: "Ping" })), 10000);
-    return c;
+    return new RpcClient(ws);
   }
-  close() { clearInterval(this.ping); this.ws.close(); }
-  send(o) { this.ws.send(JSON.stringify(o)); }
+  close() {
+    this.closing = true; clearInterval(this.ping);
+    for (const p of this.pending.values()) p.resolve(undefined);
+    this.pending.clear();
+    try { this.ws.close(1000); } catch {}
+  }
+  send(o) { if (this.ws.readyState === 1) this.ws.send(JSON.stringify(o)); }
   onMessage(raw) {
     let msgs; try { msgs = JSON.parse(raw); } catch { return; }
     for (const m of Array.isArray(msgs) ? msgs : [msgs]) {
-      const p = this.pending.get(String(m.requestId));
-      if (m._tag === "Chunk" && p) {
-        this.send({ _tag: "Ack", requestId: String(m.requestId) });
-        for (const v of m.values) p.onChunk?.(v);
+      const id = String(m.requestId);
+      const p = this.pending.get(id);
+      if (m._tag === "Chunk") {
+        this.send({ _tag: "Ack", requestId: id });
+        if (p) for (const v of m.values) p.onChunk?.(v);
       } else if (m._tag === "Exit" && p) {
-        this.pending.delete(String(m.requestId));
+        this.pending.delete(id);
         if (m.exit._tag === "Success") p.resolve(m.exit.value);
         else p.reject(new Error("RPC failure: " + JSON.stringify(m.exit.cause)));
       } else if (m._tag === "Defect") {
@@ -104,66 +102,74 @@ export class RpcClient {
     const id = String(this.next++);
     const promise = new Promise((resolve, reject) => this.pending.set(id, { resolve, reject, onChunk }));
     this.send({ _tag: "Request", id, tag, payload, headers: [] });
-    return { id, promise, interrupt: () => this.send({ _tag: "Interrupt", requestId: id, interruptors: [] }) };
+    const interrupt = () => {
+      const p = this.pending.get(id);
+      if (!p) return;
+      this.pending.delete(id); p.resolve(undefined);
+      this.send({ _tag: "Interrupt", requestId: id, interruptors: [] });
+    };
+    return { promise, interrupt };
   }
   request(tag, payload) { return this.call(tag, payload).promise; }
+  // First `snapshot` item of a subscription stream, then unsubscribe.
+  firstSnapshot(tag, payload, ms = 20000) {
+    return new Promise((resolve, reject) => {
+      const timer = setTimeout(() => { h.interrupt(); reject(new Error(`timeout waiting for ${tag} snapshot`)); }, ms);
+      const h = this.call(tag, payload, (item) => {
+        if (item?.kind === "snapshot") { clearTimeout(timer); h.interrupt(); resolve(item.snapshot); }
+      });
+      h.promise.then(
+        () => { clearTimeout(timer); reject(new Error(`${tag} ended without snapshot`)); },
+        (e) => { clearTimeout(timer); reject(e); },
+      );
+    });
+  }
 }
 
-// ---- command builders (contracts/src/orchestration.ts @ v0.0.45) ----
+// ---- helpers ----
 const now = () => new Date().toISOString();
-export function buildThreadCreate(cfg, { projectId, title, threadId = randomUUID() }) {
-  return {
-    type: "thread.create", commandId: randomUUID(), threadId, projectId, title,
-    modelSelection: cfg.model, runtimeMode: cfg.runtimeMode, interactionMode: cfg.interactionMode,
-    branch: null, worktreePath: null, createdAt: now(),
-  };
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+const threadSnapshot = (rpc, threadId) => rpc.firstSnapshot("orchestration.subscribeThread", { threadId });
+const shellSnapshot = (rpc) => rpc.firstSnapshot("orchestration.subscribeShell", {});
+
+function latestReply(thread) {
+  const msgs = thread.messages ?? [];
+  const id = thread.latestTurn?.assistantMessageId;
+  const m = (id && msgs.find((x) => x.id === id)) || [...msgs].reverse().find((x) => x.role === "assistant");
+  return m ? m.text.trim() : "";
 }
-export function buildTurnStart(cfg, { threadId, text }) {
+function printStatus(thread) {
+  const lt = thread.latestTurn;
+  console.log(`thread ${thread.id} "${thread.title}" turn=${lt ? lt.state : "none"}`);
+  const reply = latestReply(thread);
+  console.log(reply ? `reply:\n${reply}` : "reply: (none yet)");
+}
+
+// Thread defaults come from the server: project's defaultModelSelection, else the
+// most recently updated thread in that project. Nothing is hardcoded.
+function resolveThreadDefaults(shell, projectId) {
+  const project = shell.projects.find((p) => p.id === projectId);
+  if (!project) throw new Error(`project ${projectId} not found on server`);
+  const recent = shell.threads
+    .filter((t) => t.projectId === projectId)
+    .sort((a, b) => String(b.updatedAt).localeCompare(String(a.updatedAt)))[0];
+  const modelSelection = project.defaultModelSelection ?? recent?.modelSelection;
+  if (!modelSelection) throw new Error(`project ${project.title} has no default model and no threads to copy one from`);
   return {
-    type: "thread.turn.start", commandId: randomUUID(), threadId,
-    message: { messageId: randomUUID(), role: "user", text, attachments: [] },
-    runtimeMode: cfg.runtimeMode, interactionMode: cfg.interactionMode, createdAt: now(),
+    modelSelection,
+    runtimeMode: recent?.runtimeMode ?? "full-access",
+    interactionMode: recent?.interactionMode ?? "default",
   };
 }
 
-// ---- reading ----
-async function threadSnapshot(rpc, threadId) {
-  return new Promise((resolve, reject) => {
-    const h = rpc.call("orchestration.subscribeThread", { threadId }, (item) => {
-      if (item.kind === "snapshot") { h.interrupt(); resolve(item.snapshot); }
-    });
-    h.promise.catch(reject);
-    setTimeout(() => reject(new Error("timeout waiting for snapshot")), 15000);
-  });
-}
-function messagesOf(snap) { return snap.thread?.messages ?? snap.messages ?? []; }
-function printStatus(snap) {
-  const t = snap.thread;
-  const lt = t.latestTurn;
-  console.log(`thread:  ${t.id}\ntitle:   ${t.title}\nproject: ${t.projectId}`);
-  console.log(`turn:    ${lt ? `${lt.state} (requested ${lt.requestedAt}${lt.completedAt ? `, done ${lt.completedAt}` : ""})` : "none"}`);
-  console.log(`messages: ${messagesOf(snap).length}`);
-}
-function printMessages(snap, all) {
-  const ms = messagesOf(snap).filter((m) => m.role === "user" || m.role === "assistant");
-  const list = all ? ms : ms.filter((m) => m.role === "assistant").slice(-1);
-  if (!list.length) console.log("(no assistant reply yet)");
-  for (const m of list) console.log(`--- ${m.role} ${m.createdAt}${m.streaming ? " (streaming)" : ""}\n${m.text}`);
-}
-async function waitForTurn(rpc, threadId, timeoutMs) {
-  return new Promise((resolve) => {
-    let done = false;
-    const h = rpc.call("orchestration.subscribeThread", { threadId }, (item) => {
-      if (item.kind === "event") {
-        const e = item.event;
-        if (e.type === "thread.message.assistant.delta") process.stdout.write(e.payload?.delta ?? e.payload?.text ?? "");
-        if (/turn.*(completed|failed|interrupted)|session-set/.test(e.type) && !done) {
-          if (/completed|failed|interrupted/.test(e.type)) { done = true; h.interrupt(); process.stdout.write("\n"); resolve(e.type); }
-        }
-      }
-    });
-    setTimeout(() => { if (!done) { h.interrupt(); resolve("timeout"); } }, timeoutMs);
-  });
+async function waitForTurn(rpc, threadId, previousTurnId, deadline) {
+  while (Date.now() < deadline) {
+    const { thread } = await threadSnapshot(rpc, threadId);
+    const lt = thread.latestTurn;
+    if (lt && lt.turnId !== previousTurnId && lt.state !== "running") return thread;
+    await sleep(3000);
+  }
+  throw new Error("timeout waiting for turn to finish");
 }
 
 // ---- CLI ----
@@ -171,85 +177,104 @@ function parseArgs(argv) {
   const o = { _: [] };
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
-    if (a.startsWith("--")) { const k = a.slice(2); const v = argv[i + 1]?.startsWith("--") || argv[i + 1] === undefined ? true : argv[++i]; o[k] = v; }
-    else o._.push(a);
+    if (a.startsWith("--")) {
+      const k = a.slice(2);
+      o[k] = argv[i + 1] === undefined || argv[i + 1].startsWith("--") ? true : argv[++i];
+    } else o._.push(a);
   }
   return o;
 }
 const USAGE = `t3-alpha <command> [options]
-  login --url <http://127.0.0.1:5773> (--token <bearer> | --pair <pairing-code>)
-  projects                                   list projects (id, title, root)
-  create --project <id> --title <t> --prompt <p> [--wait <sec>]
-  send   --thread <id> --prompt <p> [--wait <sec>]
-  status --thread <id>
-  read   --thread <id> [--all]
-  batch  --file <path>     one JSON object per line: {"cmd":"create",...}
-  frames --project <id> --title <t> --prompt <p>   print frames only (offline)
+  login  --url <http://127.0.0.1:5773> (--token <bearer> | --pair <pairing-code>)
+  projects
+  create --project <id> --title <t> --prompt <p> [--timeout <sec>=900] [--no-wait]
+  send   --thread <id> --prompt <p> [--timeout <sec>=900] [--no-wait]
+  status --thread <id>        (alias: read)
+  batch  --file <path>        JSONL: {"cmd":"create","project":"...","title":"...","prompt":"..."}
 Config: ${CONFIG_PATH} (env T3_ALPHA_URL / T3_ALPHA_TOKEN override)`;
 
-async function run(args, cfg, rpcRef) {
+async function run(args, cfg, ctx) {
   const cmd = args._[0];
   const need = (k) => { if (!args[k] || args[k] === true) throw new Error(`missing --${k}`); return args[k]; };
-  const rpc = async () => (rpcRef.c ??= await RpcClient.connect(cfg));
+  const rpc = async () => (ctx.rpc ??= await RpcClient.connect(cfg));
+  const deadline = Date.now() + Number(args.timeout ?? 900) * 1000;
+
+  async function sendPrompt(c, threadId, text, defaults, previousTurnId) {
+    await c.request("orchestration.dispatchCommand", {
+      type: "thread.turn.start", commandId: randomUUID(), threadId,
+      message: { messageId: randomUUID(), role: "user", text, attachments: [] },
+      runtimeMode: defaults.runtimeMode, interactionMode: defaults.interactionMode, createdAt: now(),
+    });
+    if (args["no-wait"]) { console.log(`ok: prompt sent to thread ${threadId}`); return; }
+    const thread = await waitForTurn(c, threadId, previousTurnId, deadline);
+    const reply = latestReply(thread);
+    console.log(`ok: thread ${threadId} turn=${thread.latestTurn.state}`);
+    if (reply) console.log(reply);
+    if (thread.latestTurn.state !== "completed") ctx.exitCode = 1;
+  }
+
   switch (cmd) {
     case "login": {
       const c = { ...cfg, baseUrl: need("url") };
       if (args.token) c.token = args.token;
-      else { const r = await exchangePairingCode(c.baseUrl, need("pair")); c.token = r.access_token; console.log(`scope: ${r.scope}, expires_in: ${r.expires_in}s`); }
-      saveConfig(c); await wsTicket(c); console.log(`ok, saved ${CONFIG_PATH}`); return;
-    }
-    case "frames": {
-      const create = buildThreadCreate(cfg, { projectId: need("project"), title: need("title") });
-      for (const p of [create, buildTurnStart(cfg, { threadId: create.threadId, text: need("prompt") })])
-        console.log(JSON.stringify({ _tag: "Request", id: "0", tag: "orchestration.dispatchCommand", payload: p, headers: [] }));
-      return;
+      else c.token = (await exchangePairingCode(c.baseUrl, need("pair"))).access_token;
+      await wsTicket(c); saveConfig(c); console.log(`ok: saved ${CONFIG_PATH}`); return;
     }
     case "projects": {
-      const r = await new Promise((res, rej) => {
-        const h = (rpcRef.c ? Promise.resolve(rpcRef.c) : rpc()).then((c) => {
-          const hh = c.call("orchestration.subscribeShell", {}, (item) => { if (item.snapshot || item.kind === "snapshot") { hh.interrupt(); res(item.snapshot ?? item); } });
-          hh.promise.catch(rej);
-        }, rej);
-        setTimeout(() => rej(new Error("timeout")), 15000);
-      });
-      for (const p of r.projects ?? []) console.log(`${p.id}\t${p.title}\t${p.workspaceRoot ?? ""}`);
+      const s = await shellSnapshot(await rpc());
+      for (const p of s.projects) console.log(`${p.id}\t${p.title}\t${p.workspaceRoot}`);
       return;
     }
     case "create": {
       const c = await rpc();
-      const create = buildThreadCreate(cfg, { projectId: need("project"), title: need("title") });
-      await c.request("orchestration.dispatchCommand", create);
-      await c.request("orchestration.dispatchCommand", buildTurnStart(cfg, { threadId: create.threadId, text: need("prompt") }));
-      console.log(`created thread ${create.threadId}`);
-      if (args.wait) console.log(`turn: ${await waitForTurn(c, create.threadId, Number(args.wait) * 1000)}`);
+      const projectId = need("project"), title = need("title"), prompt = need("prompt");
+      const defaults = resolveThreadDefaults(await shellSnapshot(c), projectId);
+      const threadId = randomUUID();
+      await c.request("orchestration.dispatchCommand", {
+        type: "thread.create", commandId: randomUUID(), threadId, projectId, title,
+        modelSelection: defaults.modelSelection, runtimeMode: defaults.runtimeMode,
+        interactionMode: defaults.interactionMode, branch: null, worktreePath: null, createdAt: now(),
+      });
+      await sendPrompt(c, threadId, prompt, defaults, null);
       return;
     }
     case "send": {
       const c = await rpc();
       const threadId = need("thread");
-      await c.request("orchestration.dispatchCommand", buildTurnStart(cfg, { threadId, text: need("prompt") }));
-      console.log(`sent to ${threadId}`);
-      if (args.wait) console.log(`turn: ${await waitForTurn(c, threadId, Number(args.wait) * 1000)}`);
+      const { thread } = await threadSnapshot(c, threadId);
+      await sendPrompt(c, threadId, need("prompt"),
+        { runtimeMode: thread.runtimeMode, interactionMode: thread.interactionMode }, thread.latestTurn?.turnId ?? null);
       return;
     }
-    case "status": printStatus(await threadSnapshot(await rpc(), need("thread"))); return;
-    case "read": printMessages(await threadSnapshot(await rpc(), need("thread")), !!args.all); return;
+    case "status": case "read": {
+      printStatus((await threadSnapshot(await rpc(), need("thread"))).thread);
+      return;
+    }
     case "batch": {
       for (const line of readFileSync(need("file"), "utf8").split("\n").filter((l) => l.trim())) {
         const j = JSON.parse(line); const sub = { _: [j.cmd] };
-        for (const [k, v] of Object.entries(j)) if (k !== "cmd") sub[k] = String(v);
-        console.log(`> ${j.cmd}`); await run(sub, cfg, rpcRef);
+        for (const [k, v] of Object.entries(j)) if (k !== "cmd") sub[k] = v === true ? true : String(v);
+        console.log(`> ${j.cmd}`); await run(sub, cfg, ctx);
       }
       return;
     }
-    default: console.log(USAGE); if (cmd && cmd !== "help") process.exitCode = 2;
+    default:
+      console.log(USAGE);
+      if (cmd && cmd !== "help") ctx.exitCode = 2;
   }
 }
 
-if (import.meta.url === `file://${process.argv[1]}` || process.argv[1]?.endsWith("t3-alpha.mjs")) {
-  const args = parseArgs(process.argv.slice(2));
-  const rpcRef = {};
-  run(args, loadConfig(), rpcRef)
-    .catch((e) => { console.error(`error: ${e.message}`); process.exitCode = 1; })
-    .finally(() => rpcRef.c?.close());
+const args = parseArgs(process.argv.slice(2));
+const ctx = { exitCode: 0 };
+const hardTimeout = setTimeout(() => {
+  console.error("error: overall timeout"); process.exit(1);
+}, (Number(args.timeout ?? 900) + 60) * 1000);
+hardTimeout.unref();
+try {
+  await run(args, loadConfig(), ctx);
+} catch (e) {
+  console.error(`error: ${e.message}`); ctx.exitCode = 1;
+} finally {
+  ctx.rpc?.close();
 }
+process.exit(ctx.exitCode);
