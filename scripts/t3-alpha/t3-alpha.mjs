@@ -63,7 +63,8 @@ class RpcClient {
     const u = new URL("/ws", cfg.baseUrl);
     u.protocol = u.protocol === "https:" ? "wss:" : "ws:";
     u.searchParams.set("wsTicket", await wsTicket(cfg));
-    u.searchParams.set("clientSurface", "web");
+    u.searchParams.set("clientSurface", "cli");
+    u.searchParams.set("clientAppVersion", "t3-alpha");
     u.searchParams.set("clientDeviceType", "desktop");
     u.searchParams.set("orchestrationProtocol", "1");
     const ws = new WebSocket(u);
@@ -192,6 +193,7 @@ const USAGE = `t3-alpha <command> [options]
   send   --thread <id> --prompt <p> [--timeout <sec>=900] [--no-wait]
   status --thread <id>        (alias: read)
   settle --thread <id>
+  forget --thread <id>        (deletes the thread: thread.delete)
   batch  --file <path>        JSONL: {"cmd":"create","project":"...","title":"...","prompt":"..."}
 Config: ${CONFIG_PATH} (env T3_ALPHA_URL / T3_ALPHA_TOKEN override)`;
 
@@ -250,8 +252,17 @@ async function run(args, cfg, ctx) {
     }
     case "settle": {
       const threadId = need("thread");
-      const r = await (await rpc()).request("orchestration.dispatchCommand", { type: "thread.settle", commandId: randomUUID(), threadId });
+      const c = await rpc();
+      const { thread } = await threadSnapshot(c, threadId);
+      if (thread.settledOverride === "settled") { console.log(`ok: thread ${threadId} already settled (${thread.settledAt})`); return; }
+      const r = await c.request("orchestration.dispatchCommand", { type: "thread.settle", commandId: randomUUID(), threadId });
       console.log(`ok: settled thread ${threadId} (sequence ${r?.sequence})`);
+      return;
+    }
+    case "forget": {
+      const threadId = need("thread");
+      const r = await (await rpc()).request("orchestration.dispatchCommand", { type: "thread.delete", commandId: randomUUID(), threadId });
+      console.log(`ok: forgot thread ${threadId} (sequence ${r?.sequence})`);
       return;
     }
     case "status": case "read": {
