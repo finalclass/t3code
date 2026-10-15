@@ -8,12 +8,35 @@ The CLI does not choose a model. `create` copies the project's server-side defau
 
 Config: `~/.config/t3-alpha.json` (`baseUrl`, `token`), or `T3_ALPHA_URL` / `T3_ALPHA_TOKEN`.
 
+## Several hosts
+
+`~/.config/t3-alpha-hosts.json` (or `T3_ALPHA_HOSTS`) names the servers. Each entry points at an existing config file, so tokens stay where they are; inline `baseUrl` / `token` also work.
+
+```json
+{"hosts":[
+  {"name":"rog","config":"~/.config/t3-alpha.json"},
+  {"name":"archea","config":"~/.config/t3-alpha-archea.json"}
+]}
+```
+
+```
+node scripts/t3-alpha/t3-alpha.mjs hosts                       # name, baseUrl, online/offline
+node scripts/t3-alpha/t3-alpha.mjs threads --all --unsettled   # every host in parallel, host column first
+node scripts/t3-alpha/t3-alpha.mjs --host archea threads --unsettled
+node scripts/t3-alpha/t3-alpha.mjs read --thread archea:<id>
+```
+
+`threads --all` gives each host its own socket and a 5 s deadline (`--host-timeout <sec>`). A host that does not answer prints `<host>\toffline: <reason>` on stderr, and the command still exits 0 when at least one host answered. `--json` prints `{"hosts":[...],"threads":[{"host":...}]}`. `--host` / `--machine` work on every command; `link-pr` and `unlink-pr` keep `--host` for the git host, so use `--machine` or `host:threadId` there. `T3_ALPHA_URL` / `T3_ALPHA_TOKEN` apply only to the default config.
+
+`threads --all` used to mean "include archived"; that is now `--include-archived`.
+
 ```
 node scripts/t3-alpha/t3-alpha.mjs login --url http://127.0.0.1:5773 --pair <code from `t3 pair`>
 node scripts/t3-alpha/t3-alpha.mjs projects
 node scripts/t3-alpha/t3-alpha.mjs models
 node scripts/t3-alpha/t3-alpha.mjs threads --project <id> --unsettled
 node scripts/t3-alpha/t3-alpha.mjs threads --archived
+node scripts/t3-alpha/t3-alpha.mjs threads --all --unsettled
 node scripts/t3-alpha/t3-alpha.mjs search --query "zgłoszenie"
 node scripts/t3-alpha/t3-alpha.mjs create --project <id> --title "Zgłoszenie 588" --prompt "..."
 node scripts/t3-alpha/t3-alpha.mjs send --thread <id> --prompt "..." --no-wait
