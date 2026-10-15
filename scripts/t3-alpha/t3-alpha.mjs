@@ -4,12 +4,15 @@
 // Wire: Effect RPC over WebSocket, JSON serialization (apps/server/src/ws.ts RpcSerialization.layerJson).
 // Every command opens one socket, sends one request, waits for Exit, then closes.
 // Model, runtime and interaction mode change only when the command says so.
+// Several servers can be named in a hosts file; `threads --all` asks all of them in parallel.
 import { readFileSync, writeFileSync, mkdirSync, existsSync } from "node:fs";
 import { homedir } from "node:os";
-import { dirname, join } from "node:path";
+import { dirname, isAbsolute, join, resolve } from "node:path";
 import { randomUUID } from "node:crypto";
 
 const CONFIG_PATH = process.env.T3_ALPHA_CONFIG || join(homedir(), ".config", "t3-alpha.json");
+const HOSTS_PATH = process.env.T3_ALPHA_HOSTS || join(homedir(), ".config", "t3-alpha-hosts.json");
+const HOST_TIMEOUT_MS = 5_000;
 const RPC_TIMEOUT_MS = 30_000;
 const SNAPSHOT_TIMEOUT_MS = 45_000;
 const CONNECT_TIMEOUT_MS = 15_000;
@@ -26,9 +29,148 @@ function loadConfig() {
   c.baseUrl ||= c.url || "http://127.0.0.1:5773";
   return c;
 }
+// Fields starting with "_" (_path, _host) are runtime-only and never written.
 function saveConfig(c) {
-  mkdirSync(dirname(CONFIG_PATH), { recursive: true });
-  writeFileSync(CONFIG_PATH, JSON.stringify(c, null, 2) + "\n", { mode: 0o600 });
+  const path = c._path ?? CONFIG_PATH;
+  if (c._host && !c._path) throw new Error(`host ${c._host} is inline in ${HOSTS_PATH}; edit that file instead of login`);
+  const data = Object.fromEntries(Object.entries(c).filter(([k]) => !k.startsWith("_")));
+  mkdirSync(dirname(path), { recursive: true });
+  writeFileSync(path, JSON.stringify(data, null, 2) + "\n", { mode: 0o600 });
+  return path;
+}
+
+// ---- hosts file ----
+// {"hosts":[{"name":"rog","config":"~/.config/t3-alpha.json"},{"name":"archea","baseUrl":"...","token":"..."}]}
+// "config" points at an existing t3-alpha config, so tokens are not copied. T3_ALPHA_URL/T3_ALPHA_TOKEN
+// apply only to the default config, never to a named host.
+function expandPath(p, base) {
+  const s = String(p);
+  if (s === "~" || s.startsWith("~/")) return join(homedir(), s.slice(1));
+  return isAbsolute(s) ? s : resolve(base, s);
+}
+let hostsCache;
+function loadHosts({ required = true } = {}) {
+  if (hostsCache) return hostsCache;
+  if (!existsSync(HOSTS_PATH)) {
+    if (!required) return [];
+    throw new Error(`no hosts file at ${HOSTS_PATH} (see: t3-alpha help hosts)`);
+  }
+  let raw;
+  try { raw = JSON.parse(readFileSync(HOSTS_PATH, "utf8")); }
+  catch (e) { throw new Error(`cannot parse ${HOSTS_PATH}: ${e.message}`); }
+  const list = Array.isArray(raw) ? raw : raw?.hosts;
+  if (!Array.isArray(list) || list.length === 0) throw new Error(`${HOSTS_PATH} has no "hosts" list`);
+  const seen = new Set();
+  hostsCache = list.map((entry, i) => {
+    const name = entry?.name;
+    if (typeof name !== "string" || !/^[A-Za-z0-9._-]+$/.test(name)) throw new Error(`${HOSTS_PATH}: host #${i + 1} needs a name of letters, digits, . _ -`);
+    if (seen.has(name)) throw new Error(`${HOSTS_PATH}: duplicate host ${name}`);
+    seen.add(name);
+    return { name, entry };
+  });
+  return hostsCache;
+}
+function hostConfig(host) {
+  const { name, entry } = host;
+  let c = {};
+  let path;
+  if (entry.config) {
+    path = expandPath(entry.config, dirname(HOSTS_PATH));
+    if (!existsSync(path)) throw new Error(`host ${name}: config ${path} not found`);
+    try { c = JSON.parse(readFileSync(path, "utf8")); }
+    catch (e) { throw new Error(`host ${name}: cannot parse ${path}: ${e.message}`); }
+  }
+  if (entry.baseUrl || entry.url) c.baseUrl = entry.baseUrl || entry.url;
+  if (entry.token) c.token = entry.token;
+  c.baseUrl ||= c.url;
+  if (!c.baseUrl) throw new Error(`host ${name}: no baseUrl`);
+  return { ...c, _host: name, _path: path };
+}
+function findHost(name) {
+  const host = loadHosts().find((h) => h.name === name);
+  if (!host) throw new Error(`unknown host ${name}; known: ${loadHosts().map((h) => h.name).join(", ")}`);
+  return host;
+}
+// link-pr / unlink-pr already use --host for the git host, so there the machine is --machine.
+const GIT_HOST_COMMANDS = new Set(["link-pr", "unlink-pr"]);
+const THREAD_ID_KEYS = ["thread"];
+// Picks the target server from --host / --machine / a host:threadId prefix and strips them from args.
+// Returns undefined when nothing names a host, so the caller keeps its current config.
+function resolveTarget(args) {
+  const cmd = args._[0];
+  const names = [];
+  const flagged = (key) => {
+    const v = args[key];
+    if (v === undefined) return;
+    if (v === true) throw new Error(`--${key} needs a host name`);
+    names.push(String(v));
+    delete args[key];
+  };
+  flagged("machine");
+  if (!GIT_HOST_COMMANDS.has(cmd)) flagged("host");
+  for (const key of THREAD_ID_KEYS) {
+    const v = args[key];
+    if (typeof v !== "string") continue;
+    const colon = v.indexOf(":");
+    if (colon <= 0) continue;
+    const prefix = v.slice(0, colon);
+    if (!loadHosts({ required: false }).some((h) => h.name === prefix)) continue;
+    names.push(prefix);
+    args[key] = v.slice(colon + 1);
+  }
+  if (names.length === 0) return undefined;
+  if (new Set(names).size > 1) throw new Error(`conflicting hosts: ${[...new Set(names)].join(", ")}`);
+  return hostConfig(findHost(names[0]));
+}
+function withTimeout(promise, ms, label) {
+  let timer;
+  return Promise.race([
+    promise,
+    new Promise((_, rej) => { timer = setTimeout(() => rej(new Error(`${label} timeout after ${ms / 1000}s`)), ms); }),
+  ]).finally(() => clearTimeout(timer));
+}
+function errorReason(e) {
+  const cause = e?.cause;
+  const code = cause?.code ?? cause?.errors?.[0]?.code;
+  if (code) return `${e.message} (${code})`;
+  return String(e?.message ?? e);
+}
+function hostTimeoutMs(args) {
+  const raw = opt(args, "host-timeout");
+  if (raw === undefined) return HOST_TIMEOUT_MS;
+  const n = Number(raw);
+  if (!Number.isFinite(n) || n <= 0) throw new Error("--host-timeout must be a positive number of seconds");
+  return n * 1000;
+}
+// Runs fn(rpc, cfg) against every host in parallel. Each host gets its own socket and deadline;
+// a socket that opens after its deadline is closed at once.
+async function eachHost(args, fn) {
+  const ms = hostTimeoutMs(args);
+  return Promise.all(loadHosts().map(async (host) => {
+    let rpc;
+    let expired = false;
+    const controller = new AbortController();
+    const work = (async () => {
+      const cfg = hostConfig(host);
+      const c = await RpcClient.connect(cfg, { signal: controller.signal, timeoutMs: ms });
+      if (expired) { c.close(); throw new Error("late connect"); }
+      rpc = c;
+      return { cfg, value: await fn(c, cfg) };
+    })();
+    try {
+      const { cfg, value } = await withTimeout(work, ms, "host");
+      return { host: host.name, baseUrl: cfg.baseUrl, ok: true, value };
+    } catch (e) {
+      expired = true;
+      controller.abort();
+      work.catch(() => {});
+      let baseUrl = null;
+      try { baseUrl = hostConfig(host).baseUrl; } catch {}
+      return { host: host.name, baseUrl, ok: false, error: errorReason(e) };
+    } finally {
+      rpc?.close();
+    }
+  }));
 }
 
 // ---- HTTP auth ----
@@ -48,10 +190,10 @@ async function exchangePairingCode(baseUrl, code) {
   if (!r.ok) throw new Error(`token exchange HTTP ${r.status}: ${t}`);
   return JSON.parse(t);
 }
-async function wsTicket(cfg) {
-  if (!cfg.token) throw new Error(`no token in ${CONFIG_PATH}; run login first`);
+async function wsTicket(cfg, signal) {
+  if (!cfg.token) throw new Error(`no token in ${cfg._path ?? (cfg._host ? HOSTS_PATH : CONFIG_PATH)}; run login first`);
   const r = await fetch(new URL("/api/auth/websocket-ticket", cfg.baseUrl), {
-    method: "POST", headers: { authorization: `Bearer ${cfg.token}` },
+    method: "POST", headers: { authorization: `Bearer ${cfg.token}` }, signal,
   });
   if (!r.ok) throw new Error(`websocket-ticket HTTP ${r.status}`);
   return (await r.json()).ticket;
@@ -76,19 +218,27 @@ class RpcClient {
     this.ping = setInterval(() => ws.readyState === 1 && this.send({ _tag: "Ping" }), 10000);
     this.ping.unref?.();
   }
-  static async connect(cfg) {
+  static async connect(cfg, { signal, timeoutMs = CONNECT_TIMEOUT_MS } = {}) {
     const u = new URL("/ws", cfg.baseUrl);
     u.protocol = u.protocol === "https:" ? "wss:" : "ws:";
-    u.searchParams.set("wsTicket", await wsTicket(cfg));
+    u.searchParams.set("wsTicket", await wsTicket(cfg, signal));
     u.searchParams.set("clientSurface", "cli");
     u.searchParams.set("clientAppVersion", "t3-alpha");
     u.searchParams.set("clientDeviceType", "desktop");
     u.searchParams.set("orchestrationProtocol", "1");
+    if (signal?.aborted) throw new Error("aborted");
     const ws = new WebSocket(u);
     await new Promise((res, rej) => {
-      const timer = setTimeout(() => rej(new Error("WebSocket connect timeout")), CONNECT_TIMEOUT_MS);
-      ws.addEventListener("open", () => { clearTimeout(timer); res(); }, { once: true });
-      ws.addEventListener("error", () => { clearTimeout(timer); rej(new Error("WebSocket connect failed")); }, { once: true });
+      const fail = (message) => {
+        clearTimeout(timer); signal?.removeEventListener("abort", onAbort);
+        try { ws.close(); } catch {}
+        rej(new Error(message));
+      };
+      const onAbort = () => fail("aborted");
+      const timer = setTimeout(() => fail("WebSocket connect timeout"), timeoutMs);
+      signal?.addEventListener("abort", onAbort, { once: true });
+      ws.addEventListener("open", () => { clearTimeout(timer); signal?.removeEventListener("abort", onAbort); res(); }, { once: true });
+      ws.addEventListener("error", () => fail("WebSocket connect failed"), { once: true });
     });
     return new RpcClient(ws);
   }
@@ -449,7 +599,7 @@ function selectThreads(threads, args) {
     const snoozed = isSnoozed(thread);
     const pinned = thread.pinnedAt != null;
     if (args.pinned === true && !pinned) return false;
-    if (shelves.length === 0) return args.all === true || !archived;
+    if (shelves.length === 0) return args["include-archived"] === true || !archived;
     return shelves.some((shelf) => {
       if (shelf === "archived") return archived;
       if (shelf === "settled") return settled && !archived;
@@ -490,10 +640,20 @@ const HELP = {
   models: `models [--json]
   List provider instances and their model slugs, including effort/option choices.
   Does not change any thread.`,
-  threads: `threads [--project <id>] [--unsettled] [--settled] [--archived] [--snoozed] [--pinned] [--all] [--json]
+  threads: `threads [--all [--host-timeout <sec>=5]] [--project <id>] [--unsettled] [--settled] [--archived] [--snoozed]
+          [--pinned] [--include-archived] [--json]
   List threads. With no shelf flag, archived threads are hidden. Shelf flags combine as a union.
   --pinned and --project narrow the result. --unsettled is the inbox: not settled, not snoozed, not archived.
-  The live shell omits archived threads. --archived and --all read orchestration.getArchivedShellSnapshot.`,
+  The live shell omits archived threads. --archived and --include-archived read orchestration.getArchivedShellSnapshot.
+  --all asks every host in the hosts file in parallel and prepends a host column. A host that does not answer
+  within --host-timeout prints "<host>\toffline: <reason>" to stderr; exit is 0 when at least one host answered.
+  With --json, --all prints {"hosts":[{host,baseUrl,online,count|error}],"threads":[{host,...}]}.`,
+  hosts: `hosts [--host-timeout <sec>=5] [--json]
+  List hosts from ${HOSTS_PATH} (env T3_ALPHA_HOSTS) with baseUrl and online/offline.
+  File: {"hosts":[{"name":"rog","config":"~/.config/t3-alpha.json"},{"name":"archea","config":"~/.config/t3-alpha-archea.json"}]}
+  "config" points at an existing t3-alpha config; inline "baseUrl" and "token" are also accepted.
+  Any command takes --host <name> (or --machine <name>) to run against that host, and --thread accepts host:threadId.
+  link-pr and unlink-pr keep --host for the git host; use --machine or host:threadId there.`,
   create: `create --project <id> --title <title> --prompt <text> [--timeout <sec>=900] [--no-wait]
          [--model <slug>] [--instance <id>] [--effort <level>] [--option id=value] [--runtime <mode>] [--interaction <mode>] [--json]
   Create a thread and send the prompt. The model, runtime and interaction mode come from the server
@@ -581,7 +741,8 @@ const USAGE = `t3-alpha <command> [--json] [--help]
 ${Object.keys(HELP).join("\n")}
 
 Global: --json prints one JSON document instead of text. --timeout <sec> bounds turn waits (default 900).
-Config: ${CONFIG_PATH} (env T3_ALPHA_URL / T3_ALPHA_TOKEN override).
+--host <name> / --machine <name> runs the command on a host from the hosts file; --thread also accepts host:threadId.
+Config: ${CONFIG_PATH} (env T3_ALPHA_URL / T3_ALPHA_TOKEN override). Hosts: ${HOSTS_PATH} (env T3_ALPHA_HOSTS).
 t3-alpha help <command> prints that command. The CLI never picks a model on its own.`;
 
 function printHelp(topic) {
@@ -600,6 +761,16 @@ function printHelp(topic) {
 }
 
 async function run(args, cfg, ctx) {
+  const target = resolveTarget(args);
+  if (target) {
+    if (args.all === true && args._[0] === "threads") throw new Error("pass either --all or a host, not both");
+    if (ctx.cfg?._host === target._host) return run(args, ctx.cfg, ctx);
+    const sub = { exitCode: 0, cfg: target };
+    try { await run(args, target, sub); }
+    finally { sub.rpc?.close(); }
+    if (sub.exitCode) ctx.exitCode = sub.exitCode;
+    return;
+  }
   const cmd = args._[0];
   const rpc = async () => (ctx.rpc ??= await RpcClient.connect(cfg));
   const deadline = Date.now() + Number(args.timeout ?? 900) * 1000;
@@ -646,8 +817,9 @@ async function run(args, cfg, ctx) {
       const c = { ...cfg, baseUrl: need(args, "url") };
       if (args.token && args.token !== true) c.token = args.token;
       else c.token = (await exchangePairingCode(c.baseUrl, need(args, "pair"))).access_token;
-      await wsTicket(c); saveConfig(c);
-      emit(args, `ok: saved ${CONFIG_PATH}`, { ok: true, path: CONFIG_PATH, baseUrl: c.baseUrl });
+      await wsTicket(c);
+      const path = saveConfig(c);
+      emit(args, `ok: saved ${path}`, { ok: true, path, baseUrl: c.baseUrl });
       return;
     }
     case "projects": {
@@ -695,20 +867,46 @@ async function run(args, cfg, ctx) {
       return;
     }
     case "threads": {
-      const c = await rpc();
-      const shell = await shellSnapshot(c);
-      let threads = shell.threads ?? [];
-      if (args.all === true || args.archived === true) {
-        const seen = new Set(threads.map((thread) => thread.id));
-        for (const thread of await archivedThreads(c)) {
-          if (!seen.has(thread.id)) threads.push(thread);
+      const listRows = async (c) => {
+        const shell = await shellSnapshot(c);
+        let threads = shell.threads ?? [];
+        if (args["include-archived"] === true || args.archived === true) {
+          const seen = new Set(threads.map((thread) => thread.id));
+          for (const thread of await archivedThreads(c)) {
+            if (!seen.has(thread.id)) threads.push(thread);
+          }
         }
+        return selectThreads(threads, args)
+          .map(threadRow)
+          .sort((a, b) => String(b.updatedAt).localeCompare(String(a.updatedAt)));
+      };
+      const line = (row) => `${row.id}\t${row.projectId}\tturn=${row.turn}\t${row.flags.join(",")}\t${row.title}`;
+      if (args.all === true) {
+        const results = await eachHost(args, listRows);
+        const threads = results.flatMap((r) => (r.ok ? r.value.map((row) => ({ host: r.host, ...row })) : []));
+        const hosts = results.map((r) => (r.ok
+          ? { host: r.host, baseUrl: r.baseUrl, online: true, count: r.value.length }
+          : { host: r.host, baseUrl: r.baseUrl, online: false, error: r.error }));
+        if (args.json === true) console.log(JSON.stringify({ hosts, threads }, null, 2));
+        else {
+          for (const h of hosts) if (!h.online) console.error(`${h.host}\toffline: ${h.error}`);
+          for (const row of threads) console.log(`${row.host}\t${line(row)}`);
+        }
+        if (!results.some((r) => r.ok)) ctx.exitCode = 1;
+        return;
       }
-      const rows = selectThreads(threads, args)
-        .map(threadRow)
-        .sort((a, b) => String(b.updatedAt).localeCompare(String(a.updatedAt)));
+      const rows = await listRows(await rpc());
       if (args.json === true) console.log(JSON.stringify(rows, null, 2));
-      else for (const row of rows) console.log(`${row.id}\t${row.projectId}\tturn=${row.turn}\t${row.flags.join(",")}\t${row.title}`);
+      else for (const row of rows) console.log(line(row));
+      return;
+    }
+    case "hosts": {
+      const results = await eachHost(args, async () => true);
+      const rows = results.map((r) => (r.ok
+        ? { host: r.host, baseUrl: r.baseUrl, online: true }
+        : { host: r.host, baseUrl: r.baseUrl, online: false, error: r.error }));
+      if (args.json === true) console.log(JSON.stringify({ path: HOSTS_PATH, hosts: rows }, null, 2));
+      else for (const h of rows) console.log(`${h.host}\t${h.baseUrl ?? "-"}\t${h.online ? "online" : `offline: ${h.error}`}`);
       return;
     }
     case "create": {
@@ -1148,4 +1346,5 @@ try {
 } finally {
   ctx.rpc?.close();
 }
-process.exit(ctx.exitCode);
+// Exit only after stdout drains; process.exit right away cuts large --json output written to a pipe.
+process.stdout.write("", () => process.exit(ctx.exitCode));
