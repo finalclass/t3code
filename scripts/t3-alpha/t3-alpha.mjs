@@ -1,7 +1,10 @@
 #!/usr/bin/env node
-// t3-alpha: console client for a T3 Code server (wire format of v0.0.45).
+// t3-alpha: console client for a T3 Code server (wire format of v0.1.0, orchestration protocol 2).
 // No dependencies; needs Node >= 22 (global fetch + WebSocket).
 // Wire: Effect RPC over WebSocket, JSON serialization (apps/server/src/ws.ts RpcSerialization.layerJson).
+// v0.1.0 serves orchestration V2 only: /ws rejects any other orchestrationProtocol with HTTP 426,
+// threads are read with orchestration.getThreadProjection, prompts go through message.dispatch,
+// new threads through orchestration.launchThread, and projects through projects.mutate.
 // Every command opens one socket, sends one request, waits for Exit, then closes.
 // Model, runtime and interaction mode change only when the command says so.
 // Several servers can be named in a hosts file; `threads --all` asks all of them in parallel.
@@ -21,12 +24,15 @@ const INTERACTION_MODES = ["default", "plan"];
 const APPROVAL_DECISIONS = ["accept", "acceptForSession", "acceptAlways", "decline", "cancel"];
 const PR_SOURCES = ["manual", "created", "agent", "stack", "stack-dismissed"];
 const ENV_MODES = ["local", "worktree"];
+const ORCHESTRATION_PROTOCOL = "2";
+const CREATION_SOURCE = "web"; // v0.1.0 accepts web|mobile|mcp|provider|server; clientSurface=cli marks the socket.
+const ACTIVE_RUN_STATES = ["preparing", "queued", "starting", "running", "waiting"];
 
 function loadConfig() {
   const c = existsSync(CONFIG_PATH) ? JSON.parse(readFileSync(CONFIG_PATH, "utf8")) : {};
   if (process.env.T3_ALPHA_URL) c.baseUrl = process.env.T3_ALPHA_URL;
   if (process.env.T3_ALPHA_TOKEN) c.token = process.env.T3_ALPHA_TOKEN;
-  c.baseUrl ||= c.url || "http://127.0.0.1:5773";
+  c.baseUrl ||= c.url || "http://127.0.0.1:3773";
   return c;
 }
 // Fields starting with "_" (_path, _host) are runtime-only and never written.
@@ -199,6 +205,18 @@ async function wsTicket(cfg, signal) {
   return (await r.json()).ticket;
 }
 
+// The WebSocket API hides the HTTP status of a refused upgrade. A plain GET on the same URL reaches the
+// same checks (protocol version, then auth) and returns their JSON reason. The URL holds a one-time
+// ticket that is already spent, so nothing secret is printed; only status and code are reported.
+async function probeUpgrade(wsUrl) {
+  const u = new URL(wsUrl);
+  u.protocol = u.protocol === "wss:" ? "https:" : "http:";
+  const r = await fetch(u, { signal: AbortSignal.timeout(5000) });
+  let detail = "";
+  try { const j = await r.json(); detail = [j.code, j.message].filter(Boolean).join(" "); } catch {}
+  return `HTTP ${r.status}${detail ? ` ${detail}` : ""}`;
+}
+
 // ---- Effect RPC client (JSON frames) ----
 class RpcClient {
   constructor(ws) {
@@ -225,7 +243,7 @@ class RpcClient {
     u.searchParams.set("clientSurface", "cli");
     u.searchParams.set("clientAppVersion", "t3-alpha");
     u.searchParams.set("clientDeviceType", "desktop");
-    u.searchParams.set("orchestrationProtocol", "1");
+    u.searchParams.set("orchestrationProtocol", ORCHESTRATION_PROTOCOL);
     if (signal?.aborted) throw new Error("aborted");
     const ws = new WebSocket(u);
     await new Promise((res, rej) => {
@@ -238,7 +256,9 @@ class RpcClient {
       const timer = setTimeout(() => fail("WebSocket connect timeout"), timeoutMs);
       signal?.addEventListener("abort", onAbort, { once: true });
       ws.addEventListener("open", () => { clearTimeout(timer); signal?.removeEventListener("abort", onAbort); res(); }, { once: true });
-      ws.addEventListener("error", () => fail("WebSocket connect failed"), { once: true });
+      ws.addEventListener("error", () => {
+        probeUpgrade(u).then((why) => fail(`WebSocket connect failed${why ? `: ${why}` : ""}`), () => fail("WebSocket connect failed"));
+      }, { once: true });
     });
     return new RpcClient(ws);
   }
@@ -308,20 +328,19 @@ class RpcClient {
 }
 
 // ---- helpers ----
-const now = () => new Date().toISOString();
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
-const threadSnapshot = (rpc, threadId) => rpc.firstSnapshot("orchestration.subscribeThread", { threadId });
+const threadProjection = (rpc, threadId) => rpc.request("orchestration.getThreadProjection", { threadId });
 const shellSnapshot = (rpc) => rpc.firstSnapshot("orchestration.subscribeShell", {});
 const archivedThreads = async (rpc) => (await rpc.request("orchestration.getArchivedShellSnapshot", {}))?.threads ?? [];
-function isMissingThread(error) {
-  return /not found/i.test(String(error?.message ?? ""));
-}
+const runState = (thread) => thread.status ?? "idle";
+const isActive = (thread) => ACTIVE_RUN_STATES.includes(runState(thread)) || thread.activeRunId != null;
 
 function latestReply(thread) {
-  const msgs = thread.messages ?? [];
-  const id = thread.latestTurn?.assistantMessageId;
-  const m = (id && msgs.find((x) => x.id === id)) || [...msgs].reverse().find((x) => x.role === "assistant");
-  return m ? m.text.trim() : "";
+  const msgs = (thread.messages ?? []).filter((x) => x.role === "assistant");
+  const m = (thread.latestRunId && msgs.findLast((x) => x.runId === thread.latestRunId)) || msgs.at(-1);
+  if (m) return String(m.text ?? "").trim();
+  const v = thread.latestVisibleMessage;
+  return v?.role === "assistant" ? String(v.text ?? "").trim() : "";
 }
 function isSettled(thread) {
   return thread.settledOverride === "settled" || (thread.settledAt != null && thread.settledOverride !== "active");
@@ -332,9 +351,9 @@ function isSnoozed(thread) {
   return Number.isFinite(at) && at > Date.now();
 }
 function printStatus(thread) {
-  const lt = thread.latestTurn;
   const settled = isSettled(thread);
-  console.log(`thread ${thread.id} "${thread.title}" turn=${lt ? lt.state : "none"} settled=${settled ? `yes (${thread.settledAt ?? "override"})` : "no"}`);
+  console.log(`thread ${thread.id} "${thread.title}" turn=${runState(thread)} settled=${settled ? `yes (${thread.settledAt ?? "override"})` : "no"}`);
+  if (thread.lastError) console.log(`error: ${thread.lastError}`);
   const reply = latestReply(thread);
   console.log(reply ? `reply:\n${reply}` : "reply: (none yet)");
 }
@@ -349,38 +368,12 @@ function formatOptions(options) {
   const list = optionList(options);
   return list.length ? list.map((o) => `${o.id}=${String(o.value)}`).join(",") : "-";
 }
-function pendingFromActivities(activities = []) {
-  const approvals = new Map();
-  const inputs = new Map();
-  const closedApprovals = new Set();
-  const closedInputs = new Set();
-  for (const activity of activities) {
-    const payload = activity?.payload;
-    const requestId = payload && typeof payload.requestId === "string" ? payload.requestId : null;
-    if (!requestId) continue;
-    if (activity.kind === "approval.requested" && !closedApprovals.has(requestId)) {
-      if (payload.requestType === "tool_user_input" || payload.requestType === "auth_tokens_refresh") continue;
-      approvals.set(requestId, {
-        requestId,
-        requestKind: payload.requestKind ?? payload.requestType ?? null,
-        detail: typeof payload.detail === "string" ? payload.detail : null,
-        options: Array.isArray(payload.options) ? payload.options : [],
-      });
-    } else if (activity.kind === "approval.resolved") {
-      closedApprovals.add(requestId);
-      approvals.delete(requestId);
-    } else if (activity.kind === "user-input.requested" && !closedInputs.has(requestId)) {
-      inputs.set(requestId, {
-        requestId,
-        dismissible: payload.responseMode === "message",
-        questions: Array.isArray(payload.questions) ? payload.questions : [],
-      });
-    } else if (activity.kind === "user-input.resolved") {
-      closedInputs.add(requestId);
-      inputs.delete(requestId);
-    }
-  }
-  return { approvals: [...approvals.values()], userInputs: [...inputs.values()] };
+function pendingFromRequests(requests = []) {
+  const open = requests.filter((r) => r?.status === "pending");
+  return {
+    approvals: open.filter((r) => r.kind !== "user_input").map((r) => ({ requestId: r.id, requestKind: r.kind, detail: null, options: [] })),
+    userInputs: open.filter((r) => r.kind === "user_input").map((r) => ({ requestId: r.id, dismissible: r.responseCapability?.type === "message", questions: [] })),
+  };
 }
 function formatTranscript(thread) {
   const model = thread.modelSelection ?? {};
@@ -388,7 +381,7 @@ function formatTranscript(thread) {
     `model: ${model.model ?? "-"} instance=${model.instanceId ?? "-"} options=${formatOptions(model.options)}`,
     `runtime: ${thread.runtimeMode ?? "-"}`,
     `interaction: ${thread.interactionMode ?? "-"}`,
-    `session: ${thread.session?.status ?? "none"} activeTurn=${thread.session?.activeTurnId ?? "-"}`,
+    `run: ${runState(thread)} activeRun=${thread.activeRunId ?? "-"} latestRun=${thread.latestRunId ?? "-"}`,
     `branch: ${thread.branch ?? "-"}`,
     `worktree: ${thread.worktreePath ?? "-"}`,
     `archived: ${thread.archivedAt ?? "no"} pinned: ${thread.pinnedAt ?? "no"} snoozedUntil: ${thread.snoozedUntil ?? "no"}`,
@@ -397,10 +390,10 @@ function formatTranscript(thread) {
   const messages = thread.messages ?? [];
   lines.push(`messages: ${messages.length}`);
   for (const message of messages) {
-    lines.push(`--- ${message.role} ${message.id} turn=${message.turnId ?? "-"} streaming=${message.streaming ? "yes" : "no"}`);
+    lines.push(`--- ${message.role} ${message.id} run=${message.runId ?? "-"} streaming=${message.streaming ? "yes" : "no"}`);
     lines.push(message.text ?? "");
   }
-  const pending = pendingFromActivities(thread.activities);
+  const pending = pendingFromRequests(thread.runtimeRequests);
   if (pending.approvals.length === 0) lines.push("pending-approval: none");
   for (const approval of pending.approvals) {
     lines.push(`pending-approval: ${approval.requestId} kind=${approval.requestKind ?? "-"} detail=${approval.detail ?? "-"}`);
@@ -417,12 +410,14 @@ function formatTranscript(thread) {
   return lines.join("\n");
 }
 function threadView(thread) {
-  const pending = pendingFromActivities(thread.activities);
+  const pending = pendingFromRequests(thread.runtimeRequests);
   return {
     id: thread.id,
     projectId: thread.projectId,
     title: thread.title,
-    turn: thread.latestTurn ?? null,
+    turn: runState(thread),
+    activeRunId: thread.activeRunId ?? null,
+    latestRunId: thread.latestRunId ?? null,
     settled: isSettled(thread),
     settledAt: thread.settledAt ?? null,
     settledOverride: thread.settledOverride ?? null,
@@ -435,12 +430,11 @@ function threadView(thread) {
     interactionMode: thread.interactionMode ?? null,
     branch: thread.branch ?? null,
     worktreePath: thread.worktreePath ?? null,
-    session: thread.session ?? null,
     messages: (thread.messages ?? []).map((message) => ({
       id: message.id,
       role: message.role,
       text: message.text,
-      turnId: message.turnId ?? null,
+      runId: message.runId ?? null,
       streaming: message.streaming === true,
       createdAt: message.createdAt ?? null,
     })),
@@ -467,11 +461,14 @@ function resolveThreadDefaults(shell, projectId) {
   };
 }
 
-async function waitForTurn(rpc, threadId, previousTurnId, deadline) {
+// Waits for a run newer than previousRunId to leave the active states.
+async function waitForTurn(rpc, threadId, previousRunId, deadline) {
   while (Date.now() < deadline) {
-    const { thread } = await threadSnapshot(rpc, threadId);
-    const lt = thread.latestTurn;
-    if (lt && lt.turnId !== previousTurnId && lt.state !== "running") return thread;
+    const thread = await loadThread(rpc, threadId);
+    const run = (thread.runs ?? []).findLast((r) => r.id === thread.latestRunId);
+    if (thread.latestRunId && thread.latestRunId !== previousRunId && run && !ACTIVE_RUN_STATES.includes(run.status)) {
+      return { ...thread, status: run.status };
+    }
     await sleep(3000);
   }
   throw new Error("timeout waiting for turn to finish");
@@ -579,10 +576,26 @@ function sequenceOf(result) {
 async function dispatch(rpc, command) {
   return rpc.request("orchestration.dispatchCommand", { commandId: randomUUID(), ...command });
 }
+// Shell row (status, settle/snooze state, run ids) plus the projection's messages, runs and requests.
 async function loadThread(rpc, threadId) {
-  const snapshot = await threadSnapshot(rpc, threadId);
-  if (!snapshot?.thread) throw new Error(`thread ${threadId} not found`);
-  return snapshot.thread;
+  const shell = await shellSnapshot(rpc);
+  let row = [...(shell.threads ?? []), ...(shell.archivedThreads ?? [])].find((t) => t.id === threadId);
+  if (!row) row = (await archivedThreads(rpc)).find((t) => t.id === threadId);
+  const projection = await threadProjection(rpc, threadId).catch((e) => { if (!row) throw e; return null; });
+  if (!row && !projection?.thread) throw new Error(`thread ${threadId} not found`);
+  return {
+    ...(projection?.thread ?? {}),
+    ...(row ?? {}),
+    messages: projection?.messages ?? [],
+    runs: projection?.runs ?? [],
+    runtimeRequests: projection?.runtimeRequests ?? [],
+    checkpoints: projection?.checkpoints ?? [],
+    _projection: projection != null,
+  };
+}
+async function serverResolvesContext(rpc) {
+  const config = await rpc.request("server.getConfig", {});
+  return config?.environment?.capabilities?.serverResolvedCommandContext === true;
 }
 function selectThreads(threads, args) {
   const project = opt(args, "project");
@@ -615,13 +628,12 @@ function threadRow(thread) {
   else if (isSettled(thread)) flags.push("settled");
   else flags.push("unsettled");
   if (thread.pinnedAt) flags.push("pinned");
-  if (thread.hasPendingApprovals) flags.push("approval");
-  if (thread.hasPendingUserInput) flags.push("input");
+  if (thread.pendingRuntimeRequest) flags.push(thread.pendingRuntimeRequest.kind === "user_input" ? "input" : "approval");
   return {
     id: thread.id,
     projectId: thread.projectId,
     title: thread.title,
-    turn: thread.latestTurn?.state ?? "none",
+    turn: runState(thread),
     flags,
     updatedAt: thread.updatedAt ?? null,
     model: thread.modelSelection?.model ?? null,
@@ -682,10 +694,10 @@ const HELP = {
   snooze: `snooze --thread <id> (--until <ISO-8601> | --minutes <n>) [--json]`,
   unsnooze: `unsnooze --thread <id> [--json]
   Wake a snoozed thread (reason=user).`,
-  interrupt: `interrupt --thread <id> [--turn <turnId>] [--json]
-  Interrupt the running turn (thread.turn.interrupt).`,
+  interrupt: `interrupt --thread <id> [--run <runId>] [--json]
+  Interrupt the active run (run.interrupt). --turn is accepted as an alias of --run.`,
   model: `model --thread <id> [--model <slug>] [--instance <id>] [--effort <level>] [--option id=value]... [--clear-options] [--json]
-  thread.meta.update with modelSelection. At least one model flag is required.
+  thread.model-selection.set. At least one model flag is required.
   --effort sets the model's reasoning option. Codex and Grok use reasoningEffort; Claude uses effort.
   The id already stored on the thread wins; otherwise the server catalog decides.
   Other provider options use --option id=value (true/false becomes a boolean).
@@ -701,15 +713,15 @@ const HELP = {
   rename: `rename --thread <id> --title <title> [--json]`,
   retitle: `retitle --thread <id> [--json]
   Ask the server to regenerate the title.`,
-  branch: `branch --thread <id> (--name <branch> | --clear) [--expected <current>] [--json]`,
+  branch: `branch --thread <id> (--name <branch> | --clear) [--json]`,
   worktree: `worktree --thread <id> (--path <path> | --clear) [--json]`,
   autosettle: `autosettle --thread <id> (--on | --off) [--json]`,
   stop: `stop --thread <id> [--only-if-settled] [--json]
-  Stop the provider session (thread.session.stop).`,
+  Stop like the app's Stop button: run.interrupt with holdQueue on the active (else latest) run.`,
   revert: `revert --thread <id> --turn-count <n> [--json]
-  Restore files to the checkpoint at that turn count (thread.checkpoint.revert).`,
+  Roll back to the checkpoint of run <n> and restore files (checkpoint.rollback restoreFiles=true).`,
   "revert-chat": `revert-chat --thread <id> --turn-count <n> [--json]
-  Rewind the conversation without restoring files (thread.conversation.revert).`,
+  Roll back to run <n> without restoring files (checkpoint.rollback restoreFiles=false).`,
   "link-pr": `link-pr --thread <id> --host <host> --repository <owner/name> --number <n> --url <url> [--source <${PR_SOURCES.join("|")}>] [--json]
   Default source is manual.`,
   "unlink-pr": `unlink-pr --thread <id> --host <host> --repository <owner/name> --number <n> [--json]`,
@@ -775,28 +787,48 @@ async function run(args, cfg, ctx) {
   const rpc = async () => (ctx.rpc ??= await RpcClient.connect(cfg));
   const deadline = Date.now() + Number(args.timeout ?? 900) * 1000;
 
-  async function sendPrompt(c, threadId, text, defaults, previousTurnId) {
-    const message = {
-      type: "thread.turn.start", threadId,
-      message: { messageId: randomUUID(), role: "user", text, attachments: [] },
-      runtimeMode: defaults.runtimeMode, interactionMode: defaults.interactionMode, createdAt: now(),
-    };
-    if (hasModelArgs(args)) {
-      const reasoningId = await resolveReasoningId(c, defaults.modelSelection, args);
-      message.modelSelection = modelSelectionFrom(defaults.modelSelection, args, reasoningId);
-    }
-    await dispatch(c, message);
+  async function finishPrompt(c, threadId, previousRunId, extra = {}) {
     if (args["no-wait"]) {
-      emit(args, `ok: prompt sent to thread ${threadId}`, { ok: true, threadId, sent: true });
+      emit(args, `ok: prompt sent to thread ${threadId}`, { ok: true, threadId, sent: true, ...extra });
       return;
     }
-    const thread = await waitForTurn(c, threadId, previousTurnId, deadline);
+    const thread = await waitForTurn(c, threadId, previousRunId, deadline);
     const reply = latestReply(thread);
-    const state = thread.latestTurn.state;
+    const state = runState(thread);
     emit(args, `ok: thread ${threadId} turn=${state}${reply ? `\n${reply}` : ""}`, {
-      ok: true, threadId, turn: state, reply,
+      ok: true, threadId, turn: state, reply, ...extra,
     });
     if (state !== "completed") ctx.exitCode = 1;
+  }
+
+  // message.dispatch. Runtime and interaction mode are thread settings in v0.1.0, so a flag that
+  // changes them is sent as its own command first. A model is sent only when a model flag is present.
+  async function sendPrompt(c, thread, text) {
+    const threadId = thread.id;
+    const runtime = opt(args, "runtime");
+    const interaction = opt(args, "interaction");
+    if (runtime && oneOf(runtime, RUNTIME_MODES, "runtime") !== thread.runtimeMode) {
+      await dispatch(c, { type: "thread.runtime-mode.set", threadId, runtimeMode: runtime });
+    }
+    if (interaction && oneOf(interaction, INTERACTION_MODES, "interaction") !== thread.interactionMode) {
+      await dispatch(c, { type: "thread.interaction-mode.set", threadId, interactionMode: interaction });
+    }
+    const message = {
+      type: "message.dispatch", createdBy: "user", creationSource: CREATION_SOURCE,
+      threadId, messageId: randomUUID(), text, attachments: [],
+    };
+    if (hasModelArgs(args)) {
+      const reasoningId = await resolveReasoningId(c, thread.modelSelection, args);
+      message.modelSelection = modelSelectionFrom(thread.modelSelection, args, reasoningId);
+    }
+    if (await serverResolvesContext(c)) {
+      message.dispatchMode = { type: "start_immediately" };
+      message.deliveryIntent = "auto";
+    } else {
+      message.dispatchMode = isActive(thread) ? { type: "queue_after_active" } : { type: "start_immediately" };
+    }
+    await dispatch(c, message);
+    await finishPrompt(c, threadId, thread.latestRunId ?? null);
   }
 
   async function mutate(type, threadId, extra, already, label) {
@@ -922,46 +954,33 @@ async function run(args, cfg, ctx) {
       if (runtime) defaults.runtimeMode = oneOf(runtime, RUNTIME_MODES, "runtime");
       if (interaction) defaults.interactionMode = oneOf(interaction, INTERACTION_MODES, "interaction");
       const threadId = randomUUID();
-      await dispatch(c, {
-        type: "thread.create", threadId, projectId, title,
+      const result = await c.request("orchestration.launchThread", {
+        commandId: randomUUID(), creationSource: CREATION_SOURCE, threadId, projectId, title,
         modelSelection: defaults.modelSelection, runtimeMode: defaults.runtimeMode,
-        interactionMode: defaults.interactionMode, branch: null, worktreePath: null, createdAt: now(),
+        interactionMode: defaults.interactionMode, workspaceStrategy: { type: "root" },
+        initialMessage: { messageId: randomUUID(), text: prompt, attachments: [] },
       });
-      await sendPrompt(c, threadId, prompt, defaults, null);
+      await finishPrompt(c, result?.threadId ?? threadId, null);
       return;
     }
     case "send": {
       const c = await rpc();
       const threadId = need(args, "thread");
+      const prompt = need(args, "prompt");
       const thread = await loadThread(c, threadId);
-      const defaults = { modelSelection: thread.modelSelection, runtimeMode: thread.runtimeMode, interactionMode: thread.interactionMode };
-      const runtime = opt(args, "runtime");
-      const interaction = opt(args, "interaction");
-      if (runtime) defaults.runtimeMode = oneOf(runtime, RUNTIME_MODES, "runtime");
-      if (interaction) defaults.interactionMode = oneOf(interaction, INTERACTION_MODES, "interaction");
-      await sendPrompt(c, threadId, need(args, "prompt"), defaults, thread.latestTurn?.turnId ?? null);
+      if (thread.deletedAt) throw new Error(`thread ${threadId} is deleted`);
+      await sendPrompt(c, thread, prompt);
       return;
     }
     case "status": case "read": {
       const threadId = need(args, "thread");
       const c = await rpc();
-      try {
-        const thread = await loadThread(c, threadId);
-        if (args.json === true) console.log(JSON.stringify(threadView(thread), null, 2));
-        else { printStatus(thread); console.log(formatTranscript(thread)); }
-      } catch (error) {
-        if (!isMissingThread(error)) throw error;
-        const shell = (await archivedThreads(c)).find((thread) => thread.id === threadId);
-        if (!shell) throw error;
-        const view = {
-          ...threadView({ ...shell, messages: [], activities: [] }),
-          messagesUnavailable: true,
-        };
-        if (args.json === true) console.log(JSON.stringify(view, null, 2));
-        else {
-          console.log(`thread ${shell.id} "${shell.title}" turn=${shell.latestTurn ? shell.latestTurn.state : "none"} settled=${isSettled(shell) ? `yes (${shell.settledAt ?? "override"})` : "no"} archived=${shell.archivedAt ?? "no"}`);
-          console.log("transcript: unavailable while archived; unarchive the thread to read messages");
-        }
+      const thread = await loadThread(c, threadId);
+      const view = { ...threadView(thread), ...(thread._projection ? {} : { messagesUnavailable: true }) };
+      if (args.json === true) console.log(JSON.stringify(view, null, 2));
+      else {
+        printStatus(thread);
+        console.log(thread._projection ? formatTranscript(thread) : "transcript: unavailable (no projection for this thread)");
       }
       return;
     }
@@ -990,14 +1009,10 @@ async function run(args, cfg, ctx) {
     case "unarchive": {
       const threadId = need(args, "thread");
       const c = await rpc();
-      try {
-        const thread = await loadThread(c, threadId);
-        if (thread.archivedAt == null) {
-          emit(args, `ok: thread ${threadId} already unarchived`, { ok: true, threadId, already: true });
-          return;
-        }
-      } catch (error) {
-        if (!isMissingThread(error)) throw error;
+      const thread = await loadThread(c, threadId).catch(() => null);
+      if (thread && thread.archivedAt == null) {
+        emit(args, `ok: thread ${threadId} already unarchived`, { ok: true, threadId, already: true });
+        return;
       }
       const result = await dispatch(c, { type: "thread.unarchive", threadId });
       emit(args, `ok: unarchived thread ${threadId} (sequence ${sequenceOf(result)})`, {
@@ -1037,10 +1052,10 @@ async function run(args, cfg, ctx) {
       return;
     case "interrupt": {
       const threadId = need(args, "thread");
-      const turnId = opt(args, "turn");
-      const result = await dispatch(await rpc(), {
-        type: "thread.turn.interrupt", threadId, createdAt: now(), ...(turnId ? { turnId } : {}),
-      });
+      const c = await rpc();
+      const runId = opt(args, "run") ?? opt(args, "turn") ?? (await loadThread(c, threadId)).activeRunId;
+      if (!runId) throw new Error(`thread ${threadId} has no active run`);
+      const result = await dispatch(c, { type: "run.interrupt", threadId, runId });
       emit(args, `ok: interrupt thread ${threadId} (sequence ${sequenceOf(result)})`, {
         ok: true, threadId, sequence: sequenceOf(result),
       });
@@ -1053,7 +1068,7 @@ async function run(args, cfg, ctx) {
       const thread = await loadThread(c, threadId);
       const reasoningId = await resolveReasoningId(c, thread.modelSelection, args);
       const modelSelection = modelSelectionFrom(thread.modelSelection, args, reasoningId);
-      const result = await dispatch(c, { type: "thread.meta.update", threadId, modelSelection });
+      const result = await dispatch(c, { type: "thread.model-selection.set", threadId, modelSelection });
       emit(args, `ok: model thread ${threadId} model=${modelSelection.model} instance=${modelSelection.instanceId} options=${formatOptions(modelSelection.options)} (sequence ${sequenceOf(result)})`, {
         ok: true, threadId, modelSelection, sequence: sequenceOf(result),
       });
@@ -1062,7 +1077,7 @@ async function run(args, cfg, ctx) {
     case "runtime": {
       const threadId = need(args, "thread");
       const runtimeMode = oneOf(need(args, "mode"), RUNTIME_MODES, "mode");
-      const result = await dispatch(await rpc(), { type: "thread.runtime-mode.set", threadId, runtimeMode, createdAt: now() });
+      const result = await dispatch(await rpc(), { type: "thread.runtime-mode.set", threadId, runtimeMode });
       emit(args, `ok: runtime thread ${threadId} ${runtimeMode} (sequence ${sequenceOf(result)})`, {
         ok: true, threadId, runtimeMode, sequence: sequenceOf(result),
       });
@@ -1071,7 +1086,7 @@ async function run(args, cfg, ctx) {
     case "interaction": {
       const threadId = need(args, "thread");
       const interactionMode = oneOf(need(args, "mode"), INTERACTION_MODES, "mode");
-      const result = await dispatch(await rpc(), { type: "thread.interaction-mode.set", threadId, interactionMode, createdAt: now() });
+      const result = await dispatch(await rpc(), { type: "thread.interaction-mode.set", threadId, interactionMode });
       emit(args, `ok: interaction thread ${threadId} ${interactionMode} (sequence ${sequenceOf(result)})`, {
         ok: true, threadId, interactionMode, sequence: sequenceOf(result),
       });
@@ -1081,7 +1096,7 @@ async function run(args, cfg, ctx) {
       const threadId = need(args, "thread");
       const requestId = need(args, "request");
       const decision = oneOf(need(args, "decision"), APPROVAL_DECISIONS, "decision");
-      const result = await dispatch(await rpc(), { type: "thread.approval.respond", threadId, requestId, decision, createdAt: now() });
+      const result = await dispatch(await rpc(), { type: "runtime-request.respond", threadId, requestId, decision });
       emit(args, `ok: approve thread ${threadId} request ${requestId} ${decision} (sequence ${sequenceOf(result)})`, {
         ok: true, threadId, requestId, decision, sequence: sequenceOf(result),
       });
@@ -1099,7 +1114,7 @@ async function run(args, cfg, ctx) {
         answers[text.slice(0, eq)] = text.slice(eq + 1);
       }
       if (Object.keys(answers).length === 0) throw new Error("pass --answers <json> or --answer questionId=text");
-      const result = await dispatch(await rpc(), { type: "thread.user-input.respond", threadId, requestId, answers, createdAt: now() });
+      const result = await dispatch(await rpc(), { type: "runtime-request.respond", threadId, requestId, answers });
       emit(args, `ok: answer thread ${threadId} request ${requestId} (sequence ${sequenceOf(result)})`, {
         ok: true, threadId, requestId, answers, sequence: sequenceOf(result),
       });
@@ -1108,7 +1123,7 @@ async function run(args, cfg, ctx) {
     case "dismiss": {
       const threadId = need(args, "thread");
       const requestId = need(args, "request");
-      const result = await dispatch(await rpc(), { type: "thread.user-input.dismiss", threadId, requestId, createdAt: now() });
+      const result = await dispatch(await rpc(), { type: "thread.user-input.dismiss", threadId, requestId });
       emit(args, `ok: dismiss thread ${threadId} request ${requestId} (sequence ${sequenceOf(result)})`, {
         ok: true, threadId, requestId, sequence: sequenceOf(result),
       });
@@ -1117,13 +1132,13 @@ async function run(args, cfg, ctx) {
     case "rename": {
       const threadId = need(args, "thread");
       const title = need(args, "title");
-      const result = await dispatch(await rpc(), { type: "thread.meta.update", threadId, title });
+      const result = await dispatch(await rpc(), { type: "thread.metadata.update", threadId, title });
       emit(args, `ok: rename thread ${threadId} (sequence ${sequenceOf(result)})`, { ok: true, threadId, title, sequence: sequenceOf(result) });
       return;
     }
     case "retitle": {
       const threadId = need(args, "thread");
-      const result = await dispatch(await rpc(), { type: "thread.meta.update", threadId, regenerateTitle: true });
+      const result = await dispatch(await rpc(), { type: "thread.metadata.update", threadId, regenerateTitle: true });
       emit(args, `ok: retitle thread ${threadId} (sequence ${sequenceOf(result)})`, { ok: true, threadId, sequence: sequenceOf(result) });
       return;
     }
@@ -1131,9 +1146,8 @@ async function run(args, cfg, ctx) {
       const threadId = need(args, "thread");
       const name = opt(args, "name");
       if (args.clear !== true && name === undefined) throw new Error("pass --name or --clear");
-      const command = { type: "thread.meta.update", threadId, branch: args.clear === true ? null : name };
-      const expected = opt(args, "expected");
-      if (expected !== undefined) command.expectedBranch = expected;
+      if (opt(args, "expected") !== undefined) throw new Error("--expected is not supported by v0.1.0 (thread.metadata.update has no expected branch)");
+      const command = { type: "thread.metadata.update", threadId, branch: args.clear === true ? null : name };
       const result = await dispatch(await rpc(), command);
       emit(args, `ok: branch thread ${threadId} ${command.branch ?? "(cleared)"} (sequence ${sequenceOf(result)})`, {
         ok: true, threadId, branch: command.branch, sequence: sequenceOf(result),
@@ -1145,7 +1159,7 @@ async function run(args, cfg, ctx) {
       const path = opt(args, "path");
       if (args.clear !== true && path === undefined) throw new Error("pass --path or --clear");
       const worktreePath = args.clear === true ? null : path;
-      const result = await dispatch(await rpc(), { type: "thread.meta.update", threadId, worktreePath });
+      const result = await dispatch(await rpc(), { type: "thread.metadata.update", threadId, worktreePath });
       emit(args, `ok: worktree thread ${threadId} ${worktreePath ?? "(cleared)"} (sequence ${sequenceOf(result)})`, {
         ok: true, threadId, worktreePath, sequence: sequenceOf(result),
       });
@@ -1164,9 +1178,16 @@ async function run(args, cfg, ctx) {
     }
     case "stop": {
       const threadId = need(args, "thread");
-      const command = { type: "thread.session.stop", threadId, createdAt: now() };
-      if (args["only-if-settled"] === true) command.onlyIfSettled = true;
-      const result = await dispatch(await rpc(), command);
+      const c = await rpc();
+      const thread = await loadThread(c, threadId);
+      if (args["only-if-settled"] === true && !isSettled(thread)) {
+        emit(args, `ok: thread ${threadId} not settled, not stopped`, { ok: true, threadId, stopped: false });
+        return;
+      }
+      const runId = thread.activeRunId ?? thread.latestRunId;
+      if (!runId) throw new Error(`thread ${threadId} has no run to stop`);
+      // The Stop button: interrupts the run and holds the queue (v0.1.0 has no session stop command).
+      const result = await dispatch(c, { type: "run.interrupt", threadId, runId, holdQueue: true });
       emit(args, `ok: stop thread ${threadId} (sequence ${sequenceOf(result)})`, { ok: true, threadId, sequence: sequenceOf(result) });
       return;
     }
@@ -1175,8 +1196,16 @@ async function run(args, cfg, ctx) {
       const threadId = need(args, "thread");
       const turnCount = Number(need(args, "turn-count"));
       if (!Number.isInteger(turnCount) || turnCount < 0) throw new Error("--turn-count must be an integer >= 0");
-      const type = cmd === "revert" ? "thread.checkpoint.revert" : "thread.conversation.revert";
-      const result = await dispatch(await rpc(), { type, threadId, turnCount, createdAt: now() });
+      const c = await rpc();
+      const thread = await loadThread(c, threadId);
+      const checkpoint = (thread.checkpoints ?? [])
+        .filter((cp) => cp.appRunOrdinal === turnCount && cp.status === "ready")
+        .sort((a, b) => b.ordinalWithinScope - a.ordinalWithinScope)[0];
+      if (!checkpoint) throw new Error(`no ready checkpoint for turn ${turnCount} on thread ${threadId}`);
+      const result = await dispatch(c, {
+        type: "checkpoint.rollback", threadId, scopeId: checkpoint.scopeId, checkpointId: checkpoint.id,
+        restoreFiles: cmd === "revert",
+      });
       emit(args, `ok: ${cmd} thread ${threadId} turn-count=${turnCount} (sequence ${sequenceOf(result)})`, {
         ok: true, threadId, turnCount, sequence: sequenceOf(result),
       });
@@ -1224,19 +1253,17 @@ async function run(args, cfg, ctx) {
     case "project-create": {
       const projectId = opt(args, "id") ?? randomUUID();
       const command = {
-        type: "project.create", projectId, title: need(args, "title"),
-        workspaceRoot: need(args, "workspace"), createdAt: now(),
+        type: "project.create", commandId: randomUUID(), projectId, title: need(args, "title"),
+        workspaceRoot: need(args, "workspace"),
       };
       if (args["create-root"] === true) command.createWorkspaceRootIfMissing = true;
-      const result = await dispatch(await rpc(), command);
-      emit(args, `ok: project-create ${projectId} (sequence ${sequenceOf(result)})`, {
-        ok: true, projectId, sequence: sequenceOf(result),
-      });
+      await (await rpc()).request("projects.mutate", command);
+      emit(args, `ok: project-create ${projectId}`, { ok: true, projectId });
       return;
     }
     case "project-update": {
       const projectId = need(args, "project");
-      const command = { type: "project.meta.update", projectId };
+      const command = { type: "project.update", commandId: randomUUID(), projectId };
       const title = opt(args, "title");
       const workspace = opt(args, "workspace");
       const favicon = opt(args, "favicon");
@@ -1252,21 +1279,17 @@ async function run(args, cfg, ctx) {
       if (opt(args, "scripts-json")) command.scripts = parseJson(need(args, "scripts-json"), "scripts-json");
       if (opt(args, "default-model-json")) command.defaultModelSelection = parseJson(need(args, "default-model-json"), "default-model-json");
       if (args["clear-default-model"] === true) command.defaultModelSelection = null;
-      if (Object.keys(command).length === 2) throw new Error("pass at least one field to change");
-      const result = await dispatch(await rpc(), command);
-      emit(args, `ok: project-update ${projectId} (sequence ${sequenceOf(result)})`, {
-        ok: true, projectId, sequence: sequenceOf(result),
-      });
+      if (Object.keys(command).length === 3) throw new Error("pass at least one field to change");
+      await (await rpc()).request("projects.mutate", command);
+      emit(args, `ok: project-update ${projectId}`, { ok: true, projectId });
       return;
     }
     case "project-delete": {
       const projectId = need(args, "project");
-      const command = { type: "project.delete", projectId };
+      const command = { type: "project.delete", commandId: randomUUID(), projectId };
       if (args.force === true) command.force = true;
-      const result = await dispatch(await rpc(), command);
-      emit(args, `ok: project-delete ${projectId} (sequence ${sequenceOf(result)})`, {
-        ok: true, projectId, sequence: sequenceOf(result),
-      });
+      await (await rpc()).request("projects.mutate", command);
+      emit(args, `ok: project-delete ${projectId}`, { ok: true, projectId });
       return;
     }
     case "search": {
